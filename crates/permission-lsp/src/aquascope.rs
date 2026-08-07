@@ -5,8 +5,8 @@
 //! fields we need; serde ignores the rest.
 
 use serde::Deserialize;
-use std::path::Path;
-use std::process::Command;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
 
 /// The R/W/O permissions a place holds, in Aquascope's naming (`drop` == Own).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -36,30 +36,93 @@ pub(crate) struct AnalysisOutput {
 
 /// Run `cargo aquascope permissions` in `crate_dir` and parse the result.
 ///
-/// The project must be set up for Aquascope (its pinned nightly toolchain);
-/// otherwise the command fails and the error is surfaced to the caller.
+/// Aquascope's driver is linked against a specific nightly's `librustc_driver`.
+/// If the project isn't pinned to that toolchain (no matching `rust-toolchain.toml`),
+/// the first run fails to load that library; we then detect the toolchain that
+/// owns it and retry pinned to it, so hovering works in any crate.
 pub(crate) fn run(crate_dir: &Path) -> Result<Vec<AnalysisOutput>, String> {
-    let output = Command::new("cargo")
-        .args(["aquascope", "permissions"])
-        .current_dir(crate_dir)
-        .output()
+    let output = invoke(crate_dir, None)
         .map_err(|e| format!("could not run `cargo aquascope` (is it installed?): {e}"))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let detail = stderr.lines().rev().find(|l| !l.trim().is_empty());
-        return Err(format!(
-            "`cargo aquascope` failed: {}",
-            detail.unwrap_or("unknown error")
-        ));
+    if output.status.success() {
+        return parse_stdout(&output.stdout);
     }
-    // The JSON is the last non-empty stdout line (cargo/miri noise goes to stderr).
-    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    if let Some(toolchain) = required_toolchain(&String::from_utf8_lossy(&output.stderr)) {
+        let retry = invoke(crate_dir, Some(&toolchain))
+            .map_err(|e| format!("could not run `cargo aquascope`: {e}"))?;
+        if retry.status.success() {
+            return parse_stdout(&retry.stdout);
+        }
+        return Err(cli_error(&retry.stderr));
+    }
+    Err(cli_error(&output.stderr))
+}
+
+/// Spawn `cargo aquascope permissions`, optionally pinned to a toolchain.
+fn invoke(crate_dir: &Path, toolchain: Option<&str>) -> std::io::Result<Output> {
+    let mut cmd = Command::new("cargo");
+    cmd.args(["aquascope", "permissions"])
+        .current_dir(crate_dir);
+    if let Some(toolchain) = toolchain {
+        cmd.env("RUSTUP_TOOLCHAIN", toolchain);
+    }
+    cmd.output()
+}
+
+/// The JSON is the last non-empty stdout line (cargo/miri noise goes to stderr).
+fn parse_stdout(stdout: &[u8]) -> Result<Vec<AnalysisOutput>, String> {
+    let stdout = String::from_utf8_lossy(stdout);
     let json = stdout
         .lines()
         .rev()
         .find(|l| !l.trim().is_empty())
         .unwrap_or("[]");
     parse(json).map_err(|e| format!("could not parse `cargo aquascope` output: {e}"))
+}
+
+fn cli_error(stderr: &[u8]) -> String {
+    let stderr = String::from_utf8_lossy(stderr);
+    let detail = stderr
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("unknown error");
+    format!("`cargo aquascope` failed: {detail}")
+}
+
+/// If `stderr` reports a missing `librustc_driver`, return the installed rustup
+/// toolchain that provides it (e.g. `nightly-2026-05-01-aarch64-apple-darwin`).
+fn required_toolchain(stderr: &str) -> Option<String> {
+    toolchain_owning_lib(missing_driver_lib(stderr)?)
+}
+
+/// Extract the `librustc_driver-<hash>.{dylib,so}` filename from a link error.
+fn missing_driver_lib(stderr: &str) -> Option<&str> {
+    let rest = &stderr[stderr.find("librustc_driver-")?..];
+    let (idx, len) =
+        (rest.find(".dylib").map(|i| (i, 6))).or_else(|| rest.find(".so").map(|i| (i, 3)))?;
+    Some(&rest[..idx + len])
+}
+
+/// Find the toolchain directory under `$RUSTUP_HOME/toolchains` whose `lib/`
+/// contains `lib_name`, returning its name.
+fn toolchain_owning_lib(lib_name: &str) -> Option<String> {
+    for entry in std::fs::read_dir(rustup_toolchains_dir()?).ok()?.flatten() {
+        let dir = entry.path();
+        if dir.join("lib").join(lib_name).is_file() {
+            return dir.file_name()?.to_str().map(String::from);
+        }
+    }
+    None
+}
+
+fn rustup_toolchains_dir() -> Option<PathBuf> {
+    if let Ok(home) = std::env::var("RUSTUP_HOME") {
+        return Some(PathBuf::from(home).join("toolchains"));
+    }
+    std::env::var("HOME")
+        .ok()
+        .map(|home| PathBuf::from(home).join(".rustup").join("toolchains"))
 }
 
 /// Parse the CLI output, discarding bodies that failed to analyze (`Err`).
@@ -138,6 +201,21 @@ mod tests {
         let bodies = parse(SAMPLE).unwrap();
         assert_eq!(bodies.len(), 1);
         assert_eq!(bodies[0].boundaries.len(), 2);
+    }
+
+    #[test]
+    fn extracts_missing_driver_lib_from_dyld_error() {
+        let macos = "dyld[92520]: Library not loaded: @rpath/librustc_driver-16d1e96e5b674978.dylib\n  \
+                     Reason: tried: '/Users/x/.rustup/toolchains/stable/lib/librustc_driver-16d1e96e5b674978.dylib' (no such file)";
+        assert_eq!(
+            missing_driver_lib(macos),
+            Some("librustc_driver-16d1e96e5b674978.dylib")
+        );
+
+        let linux = "error while loading shared libraries: librustc_driver-abc123.so: cannot open shared object file";
+        assert_eq!(missing_driver_lib(linux), Some("librustc_driver-abc123.so"));
+
+        assert_eq!(missing_driver_lib("some unrelated error"), None);
     }
 
     #[test]
