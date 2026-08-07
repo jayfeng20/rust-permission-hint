@@ -1,0 +1,11 @@
+[package]
+name = "zed-permission-hint"
+version = "0.0.0"
+edition = "2021"
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+zed_extension_api = "0.7.0"
