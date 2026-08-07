@@ -4,6 +4,8 @@ use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::*;
 use tower_lsp_server::{Client, LanguageServer, LspService, Server};
 
+mod aquascope;
+
 struct Backend {
     client: Client,
 }
