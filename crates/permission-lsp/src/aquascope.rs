@@ -3,12 +3,10 @@
 //! Aquascope prints a JSON array of `Result<AnalysisOutput, AquascopeError>`
 //! (externally tagged: `{"Ok": ...}` / `{"Err": ...}`). We model only the
 //! fields we need; serde ignores the rest.
-//!
-//! Wired into the hover handler in a later PR; until then this module is only
-//! exercised by tests.
-#![allow(dead_code)]
 
 use serde::Deserialize;
+use std::path::Path;
+use std::process::Command;
 
 /// The R/W/O permissions a place holds, in Aquascope's naming (`drop` == Own).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -25,15 +23,43 @@ struct CharPos {
     column: usize,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct PermissionsBoundary {
     location: CharPos,
     actual: Permissions,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub(crate) struct AnalysisOutput {
     boundaries: Vec<PermissionsBoundary>,
+}
+
+/// Run `cargo aquascope permissions` in `crate_dir` and parse the result.
+///
+/// The project must be set up for Aquascope (its pinned nightly toolchain);
+/// otherwise the command fails and the error is surfaced to the caller.
+pub(crate) fn run(crate_dir: &Path) -> Result<Vec<AnalysisOutput>, String> {
+    let output = Command::new("cargo")
+        .args(["aquascope", "permissions"])
+        .current_dir(crate_dir)
+        .output()
+        .map_err(|e| format!("could not run `cargo aquascope` (is it installed?): {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail = stderr.lines().rev().find(|l| !l.trim().is_empty());
+        return Err(format!(
+            "`cargo aquascope` failed: {}",
+            detail.unwrap_or("unknown error")
+        ));
+    }
+    // The JSON is the last non-empty stdout line (cargo/miri noise goes to stderr).
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json = stdout
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("[]");
+    parse(json).map_err(|e| format!("could not parse `cargo aquascope` output: {e}"))
 }
 
 /// Parse the CLI output, discarding bodies that failed to analyze (`Err`).
@@ -59,6 +85,25 @@ pub(crate) fn permissions_at(
         .filter(|b| b.location.line == line && b.location.column <= column)
         .max_by_key(|b| b.location.column)
         .map(|b| b.actual)
+}
+
+impl Permissions {
+    /// Render as a hover tooltip, e.g. `**Permissions:** R  W  ~~O~~`.
+    pub(crate) fn to_hover_markdown(self) -> String {
+        let mark = |held: bool, letter: char| {
+            if held {
+                format!("`{letter}`")
+            } else {
+                format!("~~{letter}~~")
+            }
+        };
+        format!(
+            "**Permissions:** {} {} {}",
+            mark(self.read, 'R'),
+            mark(self.write, 'W'),
+            mark(self.drop, 'O'),
+        )
+    }
 }
 
 #[cfg(test)]
