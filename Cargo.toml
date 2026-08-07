@@ -2,12 +2,6 @@
 resolver = "2"
 members = ["crates/permission-lsp"]
 
-# Lint policy (shared by every workspace crate via `[lints] workspace = true`).
-#
-# Goal: hard-gate the high-signal default clippy groups, and let `pedantic`
-# *warn* about genuinely unidiomatic code without ever blocking a build or
-# adding noise. A few pedantic lints that only nag about docs/naming are
-# turned off so warnings stay meaningful.
 [workspace.lints.rust]
 unused = { level = "deny", priority = -1 }
 

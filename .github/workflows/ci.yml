@@ -27,6 +27,4 @@ jobs:
         run: cargo build --workspace --all-targets
 
       - name: Clippy
-        # Lint levels come from [workspace.lints] in Cargo.toml: the default
-        # groups deny (hard gate), pedantic warns (visible, non-blocking).
         run: cargo clippy --workspace --all-targets
