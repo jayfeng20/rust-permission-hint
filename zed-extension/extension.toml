@@ -1,0 +1,12 @@
+id = "permission-hint"
+name = "Rust Permission Hint"
+version = "0.0.0"
+schema_version = 1
+authors = ["jayfeng20"]
+description = "Shows Rust R/W/O permissions on hover, powered by Aquascope."
+repository = "https://github.com/jayfeng20/rust-permission-hint"
+
+# Registered as an additional language server for Rust, alongside rust-analyzer.
+[language_servers.permission-lsp]
+name = "Rust Permission Hint"
+languages = ["Rust"]
