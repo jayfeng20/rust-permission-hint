@@ -5,4 +5,7 @@ edition = "2021"
 description = "Language server that shows Rust R/W/O permissions on hover, powered by Aquascope."
 license = "MIT"
 
+[lints]
+workspace = true
+
 [dependencies]
