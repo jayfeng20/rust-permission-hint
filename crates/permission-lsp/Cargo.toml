@@ -1,7 +1,7 @@
 [package]
 name = "permission-lsp"
 version = "0.0.0"
-edition = "2021"
+edition = "2024"
 description = "Language server that shows Rust R/W/O permissions on hover, powered by Aquascope."
 license = "MIT"
 
