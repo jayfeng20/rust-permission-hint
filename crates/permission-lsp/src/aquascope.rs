@@ -1,12 +1,21 @@
 //! Parsing of `cargo aquascope permissions` output and cursor lookup.
 //!
 //! Aquascope prints a JSON array of `Result<AnalysisOutput, AquascopeError>`
-//! (externally tagged: `{"Ok": ...}` / `{"Err": ...}`). We model only the
-//! fields we need; serde ignores the rest.
+//! (externally tagged: `{"Ok": ...}` / `{"Err": ...}`).
 
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+
+/// Aquascope cargo command
+const AQUASCOPE_COMMAND: &str = "cargo aquascope";
+
+/// Aquascope's `rust-toolchain.toml`, which pins the nightly its driver needs.
+const AQUASCOPE_TOOLCHAIN_URL: &str =
+    "https://github.com/cognitive-engineering-lab/aquascope/blob/main/rust-toolchain.toml";
+
+/// Aquascope's install instructions.
+const AQUASCOPE_INSTALL_URL: &str = "https://github.com/cognitive-engineering-lab/aquascope";
 
 /// The R/W/O permissions a place holds, in Aquascope's naming (`drop` == Own).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -34,28 +43,93 @@ pub(crate) struct AnalysisOutput {
     boundaries: Vec<PermissionsBoundary>,
 }
 
+/// An error interacting with Aquascope
+#[derive(Debug)]
+pub(crate) enum Error {
+    /// The `cargo aquascope` process could not be spawned.
+    Spawn(std::io::Error),
+    /// The `aquascope` cargo subcommand isn't installed.
+    NotInstalled,
+    /// Aquascope's driver library is missing and no installed toolchain provides
+    /// it (the nightly Aquascope needs isn't installed); carries the lib name.
+    MissingToolchain(String),
+    /// The process ran but exited non-zero; carries the last stderr line.
+    Command(String),
+    /// The output could not be parsed as the expected JSON.
+    Parse(serde_json::Error),
+}
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Error::Spawn(e) => {
+                write!(
+                    f,
+                    "could not run `{AQUASCOPE_COMMAND}` (is it installed?): {e}"
+                )
+            }
+            Error::NotInstalled => write!(
+                f,
+                "`{AQUASCOPE_COMMAND}` isn't installed. See Aquascope's install \
+                 instructions: {AQUASCOPE_INSTALL_URL}",
+            ),
+            Error::MissingToolchain(lib) => write!(
+                f,
+                "Aquascope's compiler driver (`{lib}`) can't be loaded — the nightly \
+                 toolchain it needs isn't installed. Install the nightly pinned here, then \
+                 run `cargo +<nightly> install aquascope`: {AQUASCOPE_TOOLCHAIN_URL}",
+            ),
+            Error::Command(detail) => write!(f, "`{AQUASCOPE_COMMAND}` failed: {detail}"),
+            Error::Parse(e) => write!(f, "could not parse `{AQUASCOPE_COMMAND}` output: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Error::Spawn(e) => Some(e),
+            Error::Parse(e) => Some(e),
+            Error::NotInstalled | Error::MissingToolchain(_) | Error::Command(_) => None,
+        }
+    }
+}
+
+impl From<serde_json::Error> for Error {
+    fn from(e: serde_json::Error) -> Self {
+        Error::Parse(e)
+    }
+}
+
 /// Run `cargo aquascope permissions` in `crate_dir` and parse the result.
 ///
 /// Aquascope's driver is linked against a specific nightly's `librustc_driver`.
 /// If the project isn't pinned to that toolchain (no matching `rust-toolchain.toml`),
 /// the first run fails to load that library; we then detect the toolchain that
 /// owns it and retry pinned to it, so hovering works in any crate.
-pub(crate) fn run(crate_dir: &Path) -> Result<Vec<AnalysisOutput>, String> {
-    let output = invoke(crate_dir, None)
-        .map_err(|e| format!("could not run `cargo aquascope` (is it installed?): {e}"))?;
+pub(crate) fn run(crate_dir: &Path) -> Result<Vec<AnalysisOutput>, Error> {
+    let output = invoke(crate_dir, None).map_err(Error::Spawn)?;
     if output.status.success() {
         return parse_stdout(&output.stdout);
     }
 
-    if let Some(toolchain) = required_toolchain(&String::from_utf8_lossy(&output.stderr)) {
-        let retry = invoke(crate_dir, Some(&toolchain))
-            .map_err(|e| format!("could not run `cargo aquascope`: {e}"))?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if not_installed(&stderr) {
+        return Err(Error::NotInstalled);
+    }
+    if let Some(toolchain) = required_toolchain(&stderr) {
+        let retry = invoke(crate_dir, Some(&toolchain)).map_err(Error::Spawn)?;
         if retry.status.success() {
             return parse_stdout(&retry.stdout);
         }
-        return Err(cli_error(&retry.stderr));
+        return Err(command_error(&retry.stderr));
     }
-    Err(cli_error(&output.stderr))
+    // A missing driver with no toolchain to satisfy it means the required nightly
+    // isn't installed; anything else is an ordinary command failure.
+    if let Some(lib) = missing_driver_lib(&stderr) {
+        return Err(Error::MissingToolchain(lib.to_string()));
+    }
+    Err(command_error(&output.stderr))
 }
 
 /// Spawn `cargo aquascope permissions`, optionally pinned to a toolchain.
@@ -70,24 +144,30 @@ fn invoke(crate_dir: &Path, toolchain: Option<&str>) -> std::io::Result<Output> 
 }
 
 /// The JSON is the last non-empty stdout line (cargo/miri noise goes to stderr).
-fn parse_stdout(stdout: &[u8]) -> Result<Vec<AnalysisOutput>, String> {
+fn parse_stdout(stdout: &[u8]) -> Result<Vec<AnalysisOutput>, Error> {
     let stdout = String::from_utf8_lossy(stdout);
     let json = stdout
         .lines()
         .rev()
         .find(|l| !l.trim().is_empty())
         .unwrap_or("[]");
-    parse(json).map_err(|e| format!("could not parse `cargo aquascope` output: {e}"))
+    Ok(parse(json)?)
 }
 
-fn cli_error(stderr: &[u8]) -> String {
+/// Wrap a non-zero exit, using the last non-empty stderr line as the detail.
+fn command_error(stderr: &[u8]) -> Error {
     let stderr = String::from_utf8_lossy(stderr);
     let detail = stderr
         .lines()
         .rev()
         .find(|l| !l.trim().is_empty())
         .unwrap_or("unknown error");
-    format!("`cargo aquascope` failed: {detail}")
+    Error::Command(detail.to_string())
+}
+
+/// Whether `stderr` indicates the `aquascope` cargo subcommand isn't installed.
+fn not_installed(stderr: &str) -> bool {
+    stderr.contains("no such") && stderr.contains("aquascope")
 }
 
 /// If `stderr` reports a missing `librustc_driver`, return the installed rustup
@@ -216,6 +296,35 @@ mod tests {
         assert_eq!(missing_driver_lib(linux), Some("librustc_driver-abc123.so"));
 
         assert_eq!(missing_driver_lib("some unrelated error"), None);
+    }
+
+    #[test]
+    fn missing_toolchain_error_gives_install_guidance() {
+        let msg = Error::MissingToolchain("librustc_driver-abc123.dylib".to_string()).to_string();
+        assert!(msg.contains("librustc_driver-abc123.dylib"));
+        assert!(msg.contains("install aquascope"));
+        assert!(msg.contains("https://github.com/cognitive-engineering-lab/aquascope"));
+    }
+
+    #[test]
+    fn detects_missing_aquascope_subcommand() {
+        assert!(not_installed("error: no such subcommand: `aquascope`"));
+        assert!(not_installed("error: no such command: `aquascope`"));
+        assert!(!not_installed("error[E0382]: borrow of moved value"));
+    }
+
+    #[test]
+    fn not_installed_error_links_install_docs() {
+        let msg = Error::NotInstalled.to_string();
+        assert!(msg.contains(AQUASCOPE_INSTALL_URL));
+    }
+
+    #[test]
+    fn command_error_uses_last_stderr_line() {
+        match command_error(b"warning: noise\nerror: real failure\n") {
+            Error::Command(detail) => assert_eq!(detail, "error: real failure"),
+            other => panic!("expected Command, got {other:?}"),
+        }
     }
 
     #[test]

@@ -83,7 +83,7 @@ impl Backend {
     fn analysis_for(
         &self,
         dir: &Path,
-    ) -> std::result::Result<Vec<aquascope::AnalysisOutput>, String> {
+    ) -> std::result::Result<Vec<aquascope::AnalysisOutput>, aquascope::Error> {
         if let Some(hit) = self.cache.lock().unwrap().get(dir) {
             return Ok(hit.clone());
         }
