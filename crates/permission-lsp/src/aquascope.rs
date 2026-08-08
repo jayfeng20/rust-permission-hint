@@ -103,10 +103,11 @@ impl From<serde_json::Error> for Error {
 
 /// Run `cargo aquascope permissions` in `crate_dir` and parse the result.
 ///
-/// Aquascope's driver is linked against a specific nightly's `librustc_driver`.
-/// If the project isn't pinned to that toolchain (no matching `rust-toolchain.toml`),
-/// the first run fails to load that library; we then detect the toolchain that
-/// owns it and retry pinned to it, so hovering works in any crate.
+/// Aquascope's driver is linked against one specific nightly's `librustc_driver`:
+/// - If the crate is already pinned to that nightly, the first run succeeds.
+/// - Otherwise the first run fails, but its error names the `librustc_driver` needed.
+/// - Then finds an installed toolchain that provides that library and retries pinned to it.
+/// - If none provides it, returns `Error::MissingToolchain`.
 pub(crate) fn run(crate_dir: &Path) -> Result<Vec<AnalysisOutput>, Error> {
     let output = invoke(crate_dir, None).map_err(Error::Spawn)?;
     if output.status.success() {
@@ -166,8 +167,11 @@ fn command_error(stderr: &[u8]) -> Error {
 }
 
 /// Whether `stderr` indicates the `aquascope` cargo subcommand isn't installed.
+///
+/// Matches cargo's own phrasing so a dyld "no such file" driver-load failure
+/// (which also mentions the `cargo-aquascope` path) isn't misread as missing.
 fn not_installed(stderr: &str) -> bool {
-    stderr.contains("no such") && stderr.contains("aquascope")
+    stderr.contains("no such command") || stderr.contains("no such subcommand")
 }
 
 /// If `stderr` reports a missing `librustc_driver`, return the installed rustup
@@ -215,8 +219,8 @@ pub(crate) fn parse(json: &str) -> serde_json::Result<Vec<AnalysisOutput>> {
 /// The `actual` permissions of the boundary under the cursor, if any.
 ///
 /// A boundary sits at the start of a place expression; hovering anywhere within
-/// that token should resolve to it. We pick, among boundaries on the cursor's
-/// line, the closest one starting at or before the cursor column.
+/// that token should resolve to it. Among boundaries on the cursor's
+/// line, the closest one starting at or before the cursor column is picked.
 pub(crate) fn permissions_at(
     bodies: &[AnalysisOutput],
     line: usize,
@@ -311,6 +315,12 @@ mod tests {
         assert!(not_installed("error: no such subcommand: `aquascope`"));
         assert!(not_installed("error: no such command: `aquascope`"));
         assert!(!not_installed("error[E0382]: borrow of moved value"));
+        // A dyld driver-load failure mentions "no such file" and the
+        // cargo-aquascope path, but must NOT be read as a missing subcommand.
+        let dyld = "dyld: Library not loaded: @rpath/librustc_driver-abc.dylib\n  \
+                    Referenced from: /Users/x/.cargo/bin/cargo-aquascope\n  \
+                    Reason: tried: '/Users/x/.rustup/toolchains/stable/lib/librustc_driver-abc.dylib' (no such file)";
+        assert!(!not_installed(dyld));
     }
 
     #[test]
