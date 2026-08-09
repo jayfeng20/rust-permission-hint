@@ -77,17 +77,12 @@ Zed builds it to WASM and registers it as an extra language server for Rust
 
 ## Usage
 
-The **project you're editing** must itself be set up for Aquascope — add a
-`rust-toolchain.toml` pinning the same nightly you installed:
+Open a `.rs` file in a Cargo project and hover a variable — the project itself
+needs no setup. When it isn't pinned to Aquascope's nightly, the server detects
+the installed toolchain that provides Aquascope's driver and re-runs against it
+automatically; if that toolchain isn't installed, the hover tells you to add it.
 
-```toml
-[toolchain]
-channel = "nightly-2026-05-01"
-components = ["rust-src", "rustc-dev", "llvm-tools-preview", "miri"]
-```
-
-Then open a `.rs` file and hover a variable. The first hover runs Aquascope
-(a few seconds); results are cached until you save.
+The first hover runs Aquascope (a few seconds); results are cached until you save.
 
 ## Limitations
 
